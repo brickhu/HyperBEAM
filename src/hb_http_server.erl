@@ -25,7 +25,7 @@ start() ->
     Loaded =
         case hb_opts:load(Loc = hb_opts:get(hb_config_location, <<"config.flat">>)) of
             {ok, Conf} ->
-                ?event(boot, {loaded_config, Loc, Conf}),
+                ?event(boot, {loaded_config, {path, Loc}, {config, Conf}}),
                 Conf;
             {error, Reason} ->
                 ?event(boot, {failed_to_load_config, Loc, Reason}),
@@ -42,7 +42,8 @@ start() ->
     UpdatedStoreOpts = 
         case StoreOpts of
             no_store -> no_store;
-            _ when is_list(StoreOpts) -> hb_store_opts:apply(StoreOpts, StoreDefaults);
+            _ when is_list(StoreOpts) ->
+                hb_store_opts:apply(StoreOpts, StoreDefaults);
             _ -> StoreOpts
         end,
     hb_store:start(UpdatedStoreOpts),
@@ -54,7 +55,7 @@ start() ->
                 Loaded
             )
         ),
-    maybe_greeter(MergedConfig, PrivWallet),
+    maybe_greeter(Loaded, PrivWallet),
     start(
         Loaded#{
             priv_wallet => PrivWallet,
@@ -114,7 +115,7 @@ print_greeter(Config, PrivWallet) ->
         "===========================================================~n"
         "== Config:                                               ==~n"
         "===========================================================~n"
-        "   ~s~n"
+        "   ~s~n~n"
         "===========================================================~n",
         [
             ?HYPERBEAM_VERSION,
@@ -195,6 +196,7 @@ new_server(RawNodeMsg) ->
                 % Attempt to start the prometheus application, if possible.
                 try
                     application:ensure_all_started([prometheus, prometheus_cowboy]),
+                    prometheus_registry:register_collector(hb_metrics_collector),
                     ProtoOpts#{
                         metrics_callback =>
                             fun prometheus_cowboy2_instrumenter:observe/1,
@@ -383,44 +385,46 @@ handle_request(RawReq, Body, ServerID) ->
                 }
             ),
             % Parse the HTTP request into HyerBEAM's message format.
-            ReqSingleton =
-                try hb_http:req_to_tabm_singleton(Req, Body, NodeMsg)
-                catch ParseError:ParseDetails:ParseStacktrace ->
-                    {parse_error, ParseError, ParseDetails, ParseStacktrace}
-                end,
-            try 
-                case ReqSingleton of
-                    {parse_error, PType, PDetails, PStacktrace} ->
-                        erlang:raise(PType, PDetails, PStacktrace);
-                    _ ->
-                        ok
-                end,
-                CommitmentCodec = hb_http:accept_to_codec(ReqSingleton, NodeMsg),
-                ?event(http,
-                    {parsed_singleton,
-                        {req_singleton, ReqSingleton},
-                        {accept_codec, CommitmentCodec}},
-                    #{}
-                ),
-                % Invoke the meta@1.0 device to handle the request.
-                {ok, Res} =
-                    dev_meta:handle(
-                        NodeMsg#{
-                            commitment_device => CommitmentCodec
-                        },
-                        ReqSingleton
-                    ),
-                hb_http:reply(Req, ReqSingleton, Res, NodeMsg)
-            catch
-                Type:Details:Stacktrace ->
-                    handle_error(
-                        Req,
-                        ReqSingleton,
-                        Type,
-                        Details,
-                        Stacktrace,
-                        NodeMsg
-                    )
+            try hb_http:req_to_tabm_singleton(Req, Body, NodeMsg) of
+                ReqSingleton ->
+                    try
+                        CommitmentCodec =
+                            hb_http:accept_to_codec(ReqSingleton, NodeMsg),
+                        ?event(http,
+                            {parsed_singleton,
+                                {req_singleton, ReqSingleton},
+                                {accept_codec, CommitmentCodec}},
+                            #{}
+                        ),
+                        % Invoke the meta@1.0 device to handle the request.
+                        {ok, Res} =
+                            dev_meta:handle(
+                                NodeMsg#{
+                                    commitment_device => CommitmentCodec
+                                },
+                                ReqSingleton
+                            ),
+                        hb_http:reply(Req, ReqSingleton, Res, NodeMsg)
+                    catch
+                        Type:Details:Stacktrace ->
+                            handle_error(
+                                Req,
+                                ReqSingleton,
+                                Type,
+                                Details,
+                                Stacktrace,
+                                NodeMsg
+                            )
+                    end
+            catch ParseError:ParseDetails:ParseStacktrace ->
+                handle_error(
+                    Req,
+                    #{},
+                    ParseError,
+                    ParseDetails,
+                    ParseStacktrace,
+                    NodeMsg
+                )
             end
     end.
 

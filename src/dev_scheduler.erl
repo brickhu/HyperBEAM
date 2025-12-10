@@ -203,7 +203,7 @@ validate_next_slot(Base, [NextAssignment|Assignments], Lookahead, Last, Opts) ->
 find_next_assignment(_Base, _Req, Schedule = [_Next|_], _LastSlot, _Opts) ->
     {ok, Schedule, undefined};
 find_next_assignment(Base, Req, _Schedule, LastSlot, Opts) ->
-    ProcID = dev_process:process_id(Base, Req, Opts),
+    ProcID = dev_process_lib:process_id(Base, Req, Opts),
     LocalCacheRes =
         case hb_util:atom(hb_opts:get(scheduler_ignore_local_cache, false, Opts)) of
             true -> not_found;
@@ -570,20 +570,28 @@ schedule(Base, Req, Opts) ->
 post_schedule(Base, Req, Opts) ->
     ?event(scheduling_message),
     % Find the target message to schedule:
-    ToSched = find_message_to_schedule(Base, Req, Opts),
+    RawToSched = find_message_to_schedule(Base, Req, Opts),
+    % If the message can not be properly loaded, this will throw an error
+    % before scheduling the message.    
+    try hb_cache:ensure_all_loaded(RawToSched, Opts) of
+        ToSched ->
+            do_post_schedule(Base, Req, ToSched, Opts)
+    catch
+        error:{necessary_message_not_found, _, _} ->
+            {error,
+                #{
+                    <<"status">> => 404,
+                    <<"body">> => <<"Cannot fully load message to schedule.">>
+                }
+            }
+    end.
+
+do_post_schedule(Base, Req, ToSched, Opts) ->
     ?event({to_sched, ToSched}),
     % Find the ProcessID of the target message:
     % - If it is a Process, use the ID of the message.
     % - If not, use the target as the ProcessID.
-    ProcID =
-        case hb_ao:get(<<"type">>, ToSched, not_found, Opts) of
-            <<"Process">> -> hb_message:id(ToSched, all, Opts);
-            _ ->
-                case hb_ao:get(<<"target">>, ToSched, not_found, Opts) of
-                    not_found -> find_target_id(Base, Req, Opts);
-                    Target -> hb_util:human_id(Target)
-                end
-        end,
+    ProcID = find_target_id(Base, Req, ToSched, Opts),
     ?event({proc_id, ProcID}),
     % Filter all unsigned keys from the source message.
     case hb_message:with_only_committed(ToSched, Opts) of
@@ -600,7 +608,7 @@ post_schedule(Base, Req, Opts) ->
             case find_server(ProcID, Base, ToSched, Opts) of
                 {local, PID} ->
                     ?event({scheduling_locally, {proc_id, ProcID}, {pid, PID}}),
-                    do_post_schedule(ProcID, PID, OnlyCommitted, Opts);
+                    post_local_schedule(ProcID, PID, OnlyCommitted, Opts);
                 {redirect, Redirect} ->
                     ?event({process_is_remote, {redirect, Redirect}}),
                     case hb_opts:get(scheduler_follow_redirects, true, Opts) of
@@ -635,7 +643,7 @@ post_schedule(Base, Req, Opts) ->
 %% @doc Post schedule the message. `Req' by this point has been refined to only
 %% committed keys, and to only include the `target' message that is to be
 %% scheduled.
-do_post_schedule(ProcID, PID, Req, Opts) ->
+post_local_schedule(ProcID, PID, Req, Opts) ->
     % Should we verify the message again before scheduling?
     Verified =
         case hb_opts:get(verify_assignments, true, Opts) of
@@ -874,8 +882,8 @@ find_remote_scheduler(ProcID, [Scheduler | Rest], Opts) ->
     case find_remote_scheduler(ProcID, Rest, Opts) of
         {error, not_found} ->
             find_remote_scheduler(ProcID, Scheduler, Opts);
-        {ok, Redirect} ->
-            {ok, Redirect}
+        {redirect, Redirect} ->
+            {redirect, Redirect}
     end;
 find_remote_scheduler(ProcID, Scheduler, Opts) ->
     % Parse the scheduler location to see if it has a hint. If there is a hint,
@@ -1468,6 +1476,7 @@ post_legacy_schedule(ProcID, OnlyCommitted, Node, Opts) ->
                                 hb_json:decode(
                                     hb_ao:get(<<"body">>, AssignmentRes, Opts)
                                 ),
+                            ?event({assignment_json, AssignmentJSON}),
                             Assignment =
                                 dev_scheduler_formats:aos2_to_assignment(
                                     AssignmentJSON,
@@ -1494,12 +1503,23 @@ post_legacy_schedule(ProcID, OnlyCommitted, Node, Opts) ->
 
 %% @doc Find the schedule ID from a given request. The precidence order for 
 %% search is as follows:
-%% [1. `ToSched/id' -- in the case of `POST schedule', handled locally]
+%% 1. `ToSched/id' when `ToSched' has `type: Process'
+%% 2. `ToSched/target' when `ToSched' has a `target' key
 %% 2. `Req/target'
 %% 3. `Req/id' when `Req' has `type: Process'
 %% 4. `Base/process/id'
 %% 5. `Base/id' when `Base' has `type: Process'
 %% 6. `Req/id'
+find_target_id(Base, Req, ToSched, Opts) ->
+    case hb_ao:get(<<"type">>, ToSched, not_found, Opts) of
+        <<"Process">> ->
+            dev_process_lib:process_id(ToSched, #{}, Opts);
+        _ ->
+            case hb_ao:get(<<"target">>, ToSched, not_found, Opts) of
+                not_found -> find_target_id(Base, Req, Opts);
+                Target -> hb_util:human_id(Target)
+            end
+    end.
 find_target_id(Base, Req, Opts) ->
     TempOpts = Opts#{ hashpath => ignore },
     Res = case hb_ao:resolve(Req, <<"target">>, TempOpts) of
@@ -1510,21 +1530,20 @@ find_target_id(Base, Req, Opts) ->
             case hb_ao:resolve(Req, <<"type">>, TempOpts) of
                 {ok, <<"Process">>} ->
                     % Req is a Process, so the ID is at Req/id
-                    hb_message:id(Req, all, Opts);
+                    dev_process_lib:process_id(Req, #{}, Opts);
                 _ ->
                     case hb_ao:resolve(Base, <<"process">>, TempOpts) of
-                        {ok, Process} ->
-                            % ID found at Base/process/id
-                            hb_message:id(Process, all, Opts);
+                        {ok, _Process} ->
+                            dev_process_lib:process_id(Base, #{}, Opts);
                         _ ->
-                            % Does the message have a type of Process?
+                            % Does the message have a type of process?
                             case hb_ao:get(<<"type">>, Base, TempOpts) of
                                 <<"Process">> ->
-                                    % Yes, so try Base/id
-                                    hb_message:id(Base, all, Opts);
+                                    % Yes: Base is the process.
+                                    dev_process_lib:process_id(Base, #{}, Opts);
                                 _ ->
-                                    % No, so the ID is at Req/id
-                                    hb_message:id(Req, all, Opts)
+                                    % No: Req is the target process.
+                                    dev_process_lib:process_id(Req, #{}, Opts)
                             end
                 end
             end
@@ -1734,7 +1753,7 @@ register_location_on_boot_test() ->
 
 schedule_message_and_get_slot_test() ->
     start(),
-    Base = test_process(),
+    Base = hb_message:commit(test_process(), #{ priv_wallet => hb:wallet() }),
     Req = #{
         <<"path">> => <<"schedule">>,
         <<"method">> => <<"POST">>,
@@ -1749,7 +1768,7 @@ schedule_message_and_get_slot_test() ->
     Res = #{
         <<"path">> => <<"slot">>,
         <<"method">> => <<"GET">>,
-        <<"process">> => hb_util:id(Base)
+        <<"process">> => dev_process_lib:process_id(Base, #{}, #{})
     },
     ?event({pg, dev_scheduler_registry:get_processes()}),
     ?event({getting_schedule, {msg, Res}}),
@@ -1761,7 +1780,11 @@ redirect_to_hint_test() ->
     start(),
     RandAddr = hb_util:human_id(crypto:strong_rand_bytes(32)),
     TestLoc = <<"http://test.computer">>,
-    Base = test_process(<< RandAddr/binary, "?hint=", TestLoc/binary>>),
+    Base =
+        hb_message:commit(
+            test_process(<< RandAddr/binary, "?hint=", TestLoc/binary>>),
+            #{ priv_wallet => hb:wallet() }
+        ),
     Req = #{
         <<"path">> => <<"schedule">>,
         <<"method">> => <<"POST">>,
@@ -1816,7 +1839,7 @@ redirect_from_graphql() ->
 
 get_local_schedule_test() ->
     start(),
-    Base = test_process(),
+    Base = hb_message:commit(test_process(), #{ priv_wallet => hb:wallet() }),
     Req = #{
         <<"path">> => <<"schedule">>,
         <<"method">> => <<"POST">>,

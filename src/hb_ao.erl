@@ -876,6 +876,10 @@ maybe_force_message({Status, Res}, Opts) ->
 maybe_force_message(Res, Opts) ->
     maybe_force_message({ok, Res}, Opts).
 
+%% @doc Force a resolution result into a message, suitable for transmission
+%% via HTTP.
+force_message({Status, ResLink}, Opts) when ?IS_LINK(ResLink) ->
+    force_message({Status, hb_cache:ensure_loaded(ResLink, Opts)}, Opts);
 force_message({Status, Res}, Opts) when is_list(Res) ->
     force_message({Status, normalize_keys(Res, Opts)}, Opts);
 force_message({Status, Subres = {resolve, _}}, _Opts) ->
@@ -901,7 +905,7 @@ force_message({Status, Map}, _Opts) ->
 %% 
 %% Additionally, this function supports the `{as, Device, Msg}' syntax, which
 %% allows the key to be resolved using another device to resolve the key,
-%% while maintaining the tracability of the `HashPath' of the output message.
+%% while maintaining the traceability of the `HashPath' of the output message.
 %% 
 %% Returns the value of the key if it is found, otherwise returns the default
 %% provided by the user, or `not_found' if no default is provided.

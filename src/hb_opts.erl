@@ -135,6 +135,7 @@ default_message() ->
             #{<<"name">> => <<"apply@1.0">>, <<"module">> => dev_apply},
             #{<<"name">> => <<"auth-hook@1.0">>, <<"module">> => dev_auth_hook},
             #{<<"name">> => <<"ans104@1.0">>, <<"module">> => dev_codec_ans104},
+            #{<<"name">> => <<"bundler@1.0">>, <<"module">> => dev_bundler},
             #{<<"name">> => <<"compute@1.0">>, <<"module">> => dev_cu},
             #{<<"name">> => <<"cache@1.0">>, <<"module">> => dev_cache},
             #{<<"name">> => <<"cacheviz@1.0">>, <<"module">> => dev_cacheviz},
@@ -179,6 +180,7 @@ default_message() ->
             #{<<"name">> => <<"structured@1.0">>, <<"module">> => dev_codec_structured},
             #{<<"name">> => <<"test-device@1.0">>, <<"module">> => dev_test},
             #{<<"name">> => <<"trie@1.0">>, <<"module">> => dev_trie},
+            #{<<"name">> => <<"tx@1.0">>, <<"module">> => dev_codec_tx},
             #{<<"name">> => <<"volume@1.0">>, <<"module">> => dev_volume},
             #{<<"name">> => <<"secret@1.0">>, <<"module">> => dev_secret},
             #{<<"name">> => <<"wasi@1.0">>, <<"module">> => dev_wasi},
@@ -362,9 +364,9 @@ default_message() ->
                     }
             }
         },
+        scheduler_default_commitment_spec => <<"httpsig@1.0">>,
         genesis_wasm_import_authorities =>
             [
-                <<"fcoN_xJeisVsPXA-trzVAuIiqO3ydLQxM-L4XbrQKzY">>,
                 <<"WjnS-s03HWsDSdMnyTdzB1eHZB2QheUWP_FVRVYxkXk">>
             ]
         % Should the node track and expose prometheus metrics?
@@ -543,7 +545,12 @@ load_bin(Device, Bin, Opts) ->
             ok,
             mimic_default_types(
                 hb_cache:ensure_all_loaded(
-                    hb_message:convert(Bin, <<"structured@1.0">>, Device, Opts),
+                    hb_message:convert(
+                        Bin,
+                        <<"structured@1.0">>,
+                        Device,
+                        Opts#{ linkify_mode => false }
+                    ),
                     Opts
                 ),
                 new_atoms,

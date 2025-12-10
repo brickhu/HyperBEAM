@@ -1,6 +1,7 @@
 %% @doc A collection of utility functions for building with HyperBEAM.
 -module(hb_util).
 -export([int/1, float/1, atom/1, bin/1, list/1, map/1]).
+-export([safe_int/1]).
 -export([ceil_int/2, floor_int/2]).
 -export([id/1, id/2, native_id/1, human_id/1, human_int/1, to_hex/1]).
 -export([key_to_atom/1, key_to_atom/2, binary_to_strings/1]).
@@ -18,7 +19,7 @@
 -export([remove_common/2, to_lower/1]).
 -export([maybe_throw/2]).
 -export([is_hb_module/1, is_hb_module/2, all_hb_modules/0]).
--export([ok/1, ok/2, until/1, until/2, until/3]).
+-export([ok/1, ok/2, until/1, until/2, until/3, wait_until/2]).
 -export([count/2, mean/1, stddev/1, variance/1, weighted_random/1]).
 -export([unique/1]).
 -export([split_depth_string_aware/2, split_depth_string_aware_single/2]).
@@ -40,6 +41,15 @@ int(Str) when is_list(Str) ->
     list_to_integer(Str);
 int(Int) when is_integer(Int) ->
     Int.
+
+%% @doc Safely coerce a string to an integer, returning an ok or error tuple.
+safe_int(Value) ->
+    try
+        Integer = int(Value),
+        {ok, Integer}
+    catch
+        _:_ -> {error, invalid}
+    end.
 
 %% @doc Coerce a string to a float.
 float(Str) when is_binary(Str) ->
@@ -124,11 +134,31 @@ until(Condition, Fun, Count) ->
         true -> Count
     end.
 
+%% @doc Wait until a condition function returns true or timeout is reached.
+%% The condition function is polled every 100ms by default.
+%% Returns true if the condition was met, false if timeout was reached.
+wait_until(ConditionFun, TimeoutMs) ->
+    StartTime = erlang:system_time(millisecond),
+    until(
+        fun() ->
+            case ConditionFun() of
+                true -> true;
+                false ->
+                    CurrentTime = erlang:system_time(millisecond),
+                    CurrentTime - StartTime >= TimeoutMs
+            end
+        end
+    ),
+    %% Check one more time to determine if we succeeded or timed out
+    ConditionFun().
+
 %% @doc Return the human-readable form of an ID of a message when given either
 %% a message explicitly, raw encoded ID, or an Erlang Arweave `tx' record.
 id(Item) -> id(Item, unsigned).
-id(TX, Type) when is_record(TX, tx) ->
+id(#tx{ format = ans104 } = TX, Type) when is_record(TX, tx) ->
     encode(ar_bundles:id(TX, Type));
+id(TX, Type) when is_record(TX, tx) ->
+    encode(ar_tx:id(TX, Type));
 id(Map, Type) when is_map(Map) ->
     hb_message:id(Map, Type);
 id(Bin, _) when is_binary(Bin) andalso byte_size(Bin) == 43 ->
