@@ -215,6 +215,9 @@ init(Base, Req, Opts) ->
 %%   for the dryrun functionality that allows external clients to test
 %%   message processing without side effects.
 compute(Base, Req, Opts) ->
+    dev_console:print(Base, blue),
+    dev_console:print(Req, green),
+    dev_console:print(Opts, red),
     ProcBase = dev_process_lib:ensure_process_key(Base, Opts),
     ProcID = dev_process_lib:process_id(ProcBase, #{}, Opts),
     TargetSlot =
