@@ -316,7 +316,12 @@ verify(Self, Req, Opts) ->
     % additional keys to the commitment device.
     ReqBase =
         maps:without(
-            [<<"path">>, <<"committers">>, <<"commitments">>],
+            [
+                <<"path">>,
+                <<"committers">>,
+                <<"commitments">>,
+                <<"commitment-ids">>
+            ],
             Req
         ),
     % Verify the commitments. Stop execution if any fail.
@@ -645,7 +650,7 @@ set(Base, NewValuesMsg, Opts) ->
             KeysToSet
         )
     ),
-    % Caclulate if the keys to be set conflict with any committed keys.
+    % Calculate if the keys to be set conflict with any committed keys.
     {ok, CommittedKeys} =
         committed(
             Base,
@@ -939,7 +944,7 @@ set_ignore_undefined_test() ->
 
 verify_test() ->
     Unsigned = #{ <<"a">> => <<"b">> },
-    Signed = hb_message:commit(Unsigned, hb:wallet()),
+    Signed = hb_message:commit(Unsigned, #{ priv_wallet => hb:wallet() }),
     ?event({signed, Signed}),
     BadSigned = Signed#{ <<"a">> => <<"c">> },
     ?event({bad_signed, BadSigned}),
