@@ -198,19 +198,33 @@ list(Path, Store) ->
 %% @doc Match a template message against the cache, returning a list of IDs
 %% that match the template. We match on the binary representation of values,
 %% rather than their types explicitly, such that 'AO-Types' keys that are
-%% only partial matches do not cause the match to fail.
+%% only partial matches do not cause the match to fail. If the `match_index' key
+%% is set, indicating the presence and usage of the `~match@1.0` device, we use
+%% it to find the matching messages. This lowers the complexity class of the
+%% match to `O(keys * log(cache_size))` instead of `O(cache_size)`.
 match(MatchSpec, Opts) ->
     Spec = hb_message:convert(MatchSpec, tabm, <<"structured@1.0">>, Opts),
-    ConvertedMatchSpec =
-        maps:map(
-            fun(_, Value) ->
-                generate_binary_path(Value, Opts)
-            end,
-            maps:without([<<"ao-types">>], hb_ao:normalize_keys(Spec, Opts))
-        ),
-    case hb_store:match(hb_opts:get(store, no_viable_store, Opts), ConvertedMatchSpec) of
-        {ok, Matches} -> {ok, Matches};
-        _ -> not_found
+    NormalizedSpec = maps:without([<<"ao-types">>], hb_ao:normalize_keys(Spec, Opts)),
+    case hb_opts:get(match_index, false, Opts) of
+        false ->
+            ConvertedMatchSpec =
+                maps:map(
+                    fun(_, Value) ->
+                        generate_binary_path(Value, Opts)
+                    end,
+                    NormalizedSpec
+                ),
+            case hb_store:match(hb_opts:get(store, no_viable_store, Opts), ConvertedMatchSpec) of
+                {ok, []} -> not_found;
+                {ok, Matches} -> {ok, Matches};
+                _ -> not_found
+            end;
+        _ ->
+            case dev_match:all(NormalizedSpec, #{}, Opts) of
+                {ok, []} -> not_found;
+                {ok, Matches} -> {ok, Matches};
+                _ -> not_found
+            end
     end.
 
 %% @doc Generate the path at which a binary value should be stored.
@@ -229,6 +243,7 @@ generate_binary_path(Bin, Opts) ->
 %% the commitments of the inner messages. We do not, however, store the IDs from
 %% commitments on signed _inner_ messages. We may wish to revisit this.
 write(RawMsg, Opts) when is_map(RawMsg) ->
+    hb_message:paranoid_verify(cache_write, RawMsg, Opts),
     {ok, Msg} = hb_message:with_only_committed(RawMsg, Opts),
     TABM = hb_message:convert(Msg, tabm, <<"structured@1.0">>, Opts),
     ?event(debug_cache, {writing_full_message, {msg, TABM}}),
@@ -258,7 +273,8 @@ write(Bin, Opts) when is_binary(Bin) ->
 do_write_message(Bin, Store, Opts) when is_binary(Bin) ->
     % Write the binary in the store at its calculated content-hash.
     % Return the path.
-    ok = hb_store:write(Store, Path = generate_binary_path(Bin, Opts), Bin),
+    Path = generate_binary_path(Bin, Opts),
+    hb_store:write(Store, Path, Bin),
     %lists:map(fun(ID) -> hb_store:make_link(Store, Path, ID) end, AllIDs),
     {ok, Path};
 do_write_message(List, Store, Opts) when is_list(List) ->
@@ -271,7 +287,8 @@ do_write_message(Msg, Store, Opts) when is_map(Msg) ->
     ?event(debug_cache, {writing_message, Msg}),
     % Calculate the IDs of the message.
     UncommittedID = hb_message:id(Msg, none, Opts#{ linkify_mode => discard }),
-    AltIDs = calculate_all_ids(Msg, Opts) -- [UncommittedID],
+    AllIDs = calculate_all_ids(Msg, Opts),
+    AltIDs = AllIDs -- [UncommittedID],
     MsgHashpathAlg = hb_path:hashpath_alg(Msg, Opts),
     ?event(debug_cache, {writing_message, {id, UncommittedID}, {alt_ids, AltIDs}, {original, Msg}}),
     % Write all of the keys of the message into the store.
@@ -282,6 +299,8 @@ do_write_message(Msg, Store, Opts) when is_map(Msg) ->
         end,
         maps:without([<<"priv">>], Msg)
     ),
+    % Optionally store the message into the match index, if the index is configured.
+    dev_match:write(AllIDs, Msg, Opts),
     % Write the commitments to the store, linking each commitment ID to the
     % uncommitted message.
     lists:map(
@@ -304,7 +323,7 @@ write_key(Base, <<"commitments">>, _HPAlg, RawCommitments, Store, Opts) ->
     % and link it to `baseCommHP/commitmentID`.
     Commitments = prepare_commitments(RawCommitments, Opts),
     CommitmentsBase = commitment_path(Base, Opts),
-    ok = hb_store:make_group(Store, CommitmentsBase),
+    hb_store:make_group(Store, CommitmentsBase),
     ?event(
         {writing_commitments,
             {base, Base},
@@ -399,6 +418,7 @@ read(Path, Opts) ->
         store_read(Path, hb_opts:get(store, no_viable_store, Opts), Opts),
     case StoreReadResult of 
         {ok, Res} ->
+            hb_message:paranoid_verify(cache_read, Res, Opts),
             {ok, hb_message:normalize_commitments(Res, Opts)};
         _ -> StoreReadResult
     end.
@@ -468,12 +488,14 @@ store_read(Target, Path, Store, Opts) ->
         {store, Store}
     }),
     case hb_store:type(Store, ResolvedFullPath) of
+        failure -> failure;
         not_found -> not_found;
         simple ->
             ?event({reading_data, ResolvedFullPath}),
             case hb_store:read(Store, ResolvedFullPath) of
                 {ok, Bin} -> {ok, Bin};
-                not_found -> not_found
+                not_found -> not_found;
+                failure -> failure
             end;
         composite ->
             ?event({reading_composite, ResolvedFullPath}),
@@ -1080,5 +1102,5 @@ test_device_map_cannot_be_written_test() ->
 
 %% @doc Run a specific test with a given store module.
 run_test() ->
-    Store = hb_test_utils:test_store(hb_store_lmdb),
+    Store = hb_test_utils:test_store(),
     test_match_typed_message(Store).

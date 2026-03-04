@@ -21,7 +21,7 @@
 
 %%% Environment variables that can be used to override the default message.
 -ifdef(TEST).
--define(DEFAULT_PRINT_OPTS, [error, http_error]).
+-define(DEFAULT_PRINT_OPTS, [error, http_error, cron_error]).
 -else.
 -define(DEFAULT_PRINT_OPTS,
     [
@@ -29,6 +29,21 @@
         http_short, compute_short, push_short, copycat_short
     ]
 ).
+-endif.
+
+%%% Default name resolvers. In test mode, we do not use any name resolvers, but
+%%% in-production mode we preload the ARNS snapshot as a baseline.
+-ifndef(TEST).
+-define(DEFAULT_NAME_RESOLVERS,
+    [
+        <<
+            "G_gb7SAgogHMtmqycwaHaC6uC-CZ3akACdFv5PUaEE8",
+                "~json@1.0/deserialize&target=data"
+        >>
+    ]
+).
+-else.
+-define(DEFAULT_NAME_RESOLVERS, []).
 -endif.
 
 -ifdef(AO_PROFILING).
@@ -47,18 +62,12 @@
         hb_config_location => {"HB_CONFIG", "config.flat"},
         port => {"HB_PORT", fun erlang:list_to_integer/1, "8734"},
         mode => {"HB_MODE", fun list_to_existing_atom/1},
+        paranoid_verify =>
+            {"HB_PARANOID", fun topic_list_to_atoms/1, "false"},
         debug_print =>
-            {"HB_PRINT",
-                fun
-                    ({preparsed, Parsed}) -> Parsed;
-                    (Str) when Str == "1" -> true;
-                    (Str) when Str == "true" -> true;
-                    (Str) ->
-                        lists:map(
-                            fun(Topic) -> list_to_atom(Topic) end,
-                            string:tokens(Str, ",")
-                        )
-                end,
+            {
+                "HB_PRINT",
+                fun topic_list_to_atoms/1,
                 {preparsed, ?DEFAULT_PRINT_OPTS}
             },
         lua_scripts => {"LUA_SCRIPTS", "scripts"},
@@ -87,6 +96,17 @@
             }
     }
 ).
+
+%% @doc Convert a comma-separated list of topics, as occassionally used by `HB_*`
+%% environment variables, to a list of atoms. Additionally, will return `true' if
+%% the string is `true', `1', or `all'.
+topic_list_to_atoms({preparsed, Parsed}) -> Parsed;
+topic_list_to_atoms("false") -> [];
+topic_list_to_atoms("1") -> true;
+topic_list_to_atoms("true") -> true;
+topic_list_to_atoms("all") -> true;
+topic_list_to_atoms(Str) ->
+    lists:map(fun(Topic) -> list_to_atom(Topic) end, string:tokens(Str, ",")).
 
 %% @doc Return the default message with all environment variables set.
 default_message_with_env() ->
@@ -135,6 +155,7 @@ default_message() ->
             #{<<"name">> => <<"apply@1.0">>, <<"module">> => dev_apply},
             #{<<"name">> => <<"auth-hook@1.0">>, <<"module">> => dev_auth_hook},
             #{<<"name">> => <<"ans104@1.0">>, <<"module">> => dev_codec_ans104},
+            #{<<"name">> => <<"blacklist@1.0">>, <<"module">> => dev_blacklist},
             #{<<"name">> => <<"bundler@1.0">>, <<"module">> => dev_bundler},
             #{<<"name">> => <<"compute@1.0">>, <<"module">> => dev_cu},
             #{<<"name">> => <<"cache@1.0">>, <<"module">> => dev_cache},
@@ -146,6 +167,7 @@ default_message() ->
             #{<<"name">> => <<"faff@1.0">>, <<"module">> => dev_faff},
             #{<<"name">> => <<"flat@1.0">>, <<"module">> => dev_codec_flat},
             #{<<"name">> => <<"genesis-wasm@1.0">>, <<"module">> => dev_genesis_wasm},
+            #{<<"name">> => <<"gzip@1.0">>, <<"module">> => dev_gzip},
             #{<<"name">> => <<"greenzone@1.0">>, <<"module">> => dev_green_zone},
             #{<<"name">> => <<"httpsig@1.0">>, <<"module">> => dev_codec_httpsig},
             #{<<"name">> => <<"http-auth@1.0">>, <<"module">> => dev_codec_http_auth},
@@ -155,6 +177,7 @@ default_message() ->
             #{<<"name">> => <<"json@1.0">>, <<"module">> => dev_codec_json},
             #{<<"name">> => <<"json-iface@1.0">>, <<"module">> => dev_json_iface},
             #{<<"name">> => <<"local-name@1.0">>, <<"module">> => dev_local_name},
+            #{<<"name">> => <<"location@1.0">>, <<"module">> => dev_location},
             #{<<"name">> => <<"lookup@1.0">>, <<"module">> => dev_lookup},
             #{<<"name">> => <<"lua@5.3a">>, <<"module">> => dev_lua},
             #{<<"name">> => <<"manifest@1.0">>, <<"module">> => dev_manifest},
@@ -171,6 +194,7 @@ default_message() ->
             #{<<"name">> => <<"profile@1.0">>, <<"module">> => dev_profile},
             #{<<"name">> => <<"push@1.0">>, <<"module">> => dev_push},
             #{<<"name">> => <<"query@1.0">>, <<"module">> => dev_query},
+            #{<<"name">> => <<"rate-limit@1.0">>, <<"module">> => dev_rate_limit},
             #{<<"name">> => <<"relay@1.0">>, <<"module">> => dev_relay},
             #{<<"name">> => <<"router@1.0">>, <<"module">> => dev_router},
             #{<<"name">> => <<"scheduler@1.0">>, <<"module">> => dev_scheduler},
@@ -224,15 +248,18 @@ default_message() ->
         debug_print_map_line_threshold => 30,
         debug_print_binary_max => 60,
         debug_print_indent => 2,
+        debug_print_truncate => 30,
         stack_print_prefixes => ["hb", "dev", "ar", "maps"],
         debug_print_trace => short, % `short` | `false`. Has performance impact.
+        debug_print_metadata => true,
+        debug_print_gen_id => true,
+        debug_print_committers => true,
+        debug_print_comm_device => true,
+        debug_print_comm_type => true,
         debug_trace_type => ?DEFAULT_TRACE_TYPE,
         short_trace_len => 20,
-        debug_metadata => true,
-        debug_ids => false,
-        debug_committers => true,
         debug_show_priv => if_present,
-        debug_resolve_links => false,
+        debug_resolve_links => true,
         debug_print_fail_mode => long,
 		trusted => #{},
         snp_enforced_keys => [
@@ -240,29 +267,27 @@ default_message() ->
             initrd, append,
             vmm_type, guest_features
         ],
+        name_resolvers => ?DEFAULT_NAME_RESOLVERS,
         routes => [
+            %% Local CU routes.
             #{
-                % Routes for the genesis-wasm device to use a local CU, if requested.
                 <<"template">> => <<"/result/.*">>,
                 <<"node">> => #{ <<"prefix">> => <<"http://localhost:6363">> }
             },
             #{
-                % Routes for the genesis-wasm device to use a local CU, if requested.
                 <<"template">> => <<"/snapshot/.*">>,
                 <<"node">> => #{ <<"prefix">> => <<"http://localhost:6363">> }
             },
             #{
-                % Routes for the genesis-wasm device to use a local CU, if requested.
                 <<"template">> => <<"/dry-run.*">>,
                 <<"node">> => #{ <<"prefix">> => <<"http://localhost:6363">> }
             },
             #{
-                % Routes for the genesis-wasm device to use a local CU, if requested.
                 <<"template">> => <<"/state.*">>,
                 <<"node">> => #{ <<"prefix">> => <<"http://localhost:6363">> }
             },
+            %% GraphQL: race all gateways, take the first 200.
             #{
-                % Routes for GraphQL requests to use a remote GraphQL API.
                 <<"template">> => <<"/graphql">>,
                 <<"nodes">> =>
                     [
@@ -280,9 +305,163 @@ default_message() ->
                         }
                     ]
             },
+            %% Chunk requests: route to the nearest data nodes by
+            %% partition midpoint (byte offset). Tries 4 at a time,
+            %% ordered by proximity, until one returns 200.
             #{
-                % Routes for Arweave transaction requests to use a remote gateway.
-                <<"template">> => <<"/arweave">>,
+                <<"template">> => <<"^/arweave/chunk">>,
+                <<"nodes">> =>
+                    [
+                        %% Partitions 0-15
+                        #{
+                            <<"match">> => <<"^/arweave">>,
+                            <<"center">> => 28_800_000_000_000,
+                            <<"with">> => <<"http://data-1.arweave.xyz:1984">>,
+                            <<"opts">> => #{ http_client => httpc }
+                        },
+                        #{
+                            <<"match">> => <<"^/arweave">>,
+                            <<"center">> => 28_800_000_000_000,
+                            <<"with">> => <<"http://data-13.arweave.xyz:1984">>,
+                            <<"opts">> => #{ http_client => httpc }
+                        },
+                        %% Partitions 16-31
+                        #{
+                            <<"match">> => <<"^/arweave">>,
+                            <<"center">> => 86_400_000_000_000,
+                            <<"with">> => <<"http://data-2.arweave.xyz:1984">>,
+                            <<"opts">> => #{ http_client => httpc }
+                        },
+                        #{
+                            <<"match">> => <<"^/arweave">>,
+                            <<"center">> => 86_400_000_000_000,
+                            <<"with">> => <<"http://data-3.arweave.xyz:1984">>,
+                            <<"opts">> => #{ http_client => httpc }
+                        },
+                        #{
+                            <<"match">> => <<"^/arweave">>,
+                            <<"center">> => 86_400_000_000_000,
+                            <<"with">> => <<"http://data-14.arweave.xyz:1984">>,
+                            <<"opts">> => #{ http_client => httpc }
+                        },
+                        #{
+                            <<"match">> => <<"^/arweave">>,
+                            <<"center">> => 86_400_000_000_000,
+                            <<"with">> => <<"http://data-15.arweave.xyz:1984">>,
+                            <<"opts">> => #{ http_client => httpc }
+                        },
+                        %% Partitions 32-47
+                        #{
+                            <<"match">> => <<"^/arweave">>,
+                            <<"center">> => 144_000_000_000_000,
+                            <<"with">> => <<"http://data-4.arweave.xyz:1984">>,
+                            <<"opts">> => #{ http_client => httpc }
+                        },
+                        #{
+                            <<"match">> => <<"^/arweave">>,
+                            <<"center">> => 144_000_000_000_000,
+                            <<"with">> => <<"http://data-5.arweave.xyz:1984">>,
+                            <<"opts">> => #{ http_client => httpc }
+                        },
+                        #{
+                            <<"match">> => <<"^/arweave">>,
+                            <<"center">> => 144_000_000_000_000,
+                            <<"with">> => <<"http://data-16.arweave.xyz:1984">>,
+                            <<"opts">> => #{ http_client => httpc }
+                        },
+                        #{
+                            <<"match">> => <<"^/arweave">>,
+                            <<"center">> => 144_000_000_000_000,
+                            <<"with">> => <<"http://data-17.arweave.xyz:1984">>,
+                            <<"opts">> => #{ http_client => httpc }
+                        },
+                        %% Partitions 48-63
+                        #{
+                            <<"match">> => <<"^/arweave">>,
+                            <<"center">> => 201_600_000_000_000,
+                            <<"with">> => <<"http://data-6.arweave.xyz:1984">>,
+                            <<"opts">> => #{ http_client => httpc }
+                        },
+                        #{
+                            <<"match">> => <<"^/arweave">>,
+                            <<"center">> => 201_600_000_000_000,
+                            <<"with">> => <<"http://data-7.arweave.xyz:1984">>,
+                            <<"opts">> => #{ http_client => httpc }
+                        },
+                        %% Partitions 48-107 (tip nodes)
+                        #{
+                            <<"match">> => <<"^/arweave">>,
+                            <<"center">> => 280_800_000_000_000,
+                            <<"with">> => <<"http://tip-1.arweave.xyz:1984">>,
+                            <<"opts">> => #{ http_client => httpc }
+                        },
+                        #{
+                            <<"match">> => <<"^/arweave">>,
+                            <<"center">> => 280_800_000_000_000,
+                            <<"with">> => <<"http://tip-2.arweave.xyz:1984">>,
+                            <<"opts">> => #{ http_client => httpc }
+                        },
+                        #{
+                            <<"match">> => <<"^/arweave">>,
+                            <<"center">> => 280_800_000_000_000,
+                            <<"with">> => <<"http://tip-3.arweave.xyz:1984">>,
+                            <<"opts">> => #{ http_client => httpc }
+                        },
+                        #{
+                            <<"match">> => <<"^/arweave">>,
+                            <<"center">> => 280_800_000_000_000,
+                            <<"with">> => <<"http://tip-4.arweave.xyz:1984">>,
+                            <<"opts">> => #{ http_client => httpc }
+                        },
+                        #{
+                            <<"match">> => <<"^/arweave">>,
+                            <<"center">> => 280_800_000_000_000,
+                            <<"with">> => <<"http://tip-5.arweave.xyz:1984">>,
+                            <<"opts">> => #{ http_client => httpc }
+                        },
+                        %% Partitions 64-126
+                        #{
+                            <<"match">> => <<"^/arweave">>,
+                            <<"center">> => 343_800_000_000_000,
+                            <<"with">> => <<"http://data-8.arweave.xyz:1984">>,
+                            <<"opts">> => #{ http_client => httpc }
+                        },
+                        %% Partitions 75-138
+                        #{
+                            <<"match">> => <<"^/arweave">>,
+                            <<"center">> => 385_200_000_000_000,
+                            <<"with">> => <<"http://data-9.arweave.xyz:1984">>,
+                            <<"opts">> => #{ http_client => httpc }
+                        },
+                        #{
+                            <<"match">> => <<"^/arweave">>,
+                            <<"center">> => 385_200_000_000_000,
+                            <<"with">> => <<"http://data-10.arweave.xyz:1984">>,
+                            <<"opts">> => #{ http_client => httpc }
+                        },
+                        #{
+                            <<"match">> => <<"^/arweave">>,
+                            <<"center">> => 385_200_000_000_000,
+                            <<"with">> => <<"http://data-11.arweave.xyz:1984">>,
+                            <<"opts">> => #{ http_client => httpc }
+                        },
+                        #{
+                            <<"match">> => <<"^/arweave">>,
+                            <<"center">> => 385_200_000_000_000,
+                            <<"with">> => <<"http://data-12.arweave.xyz:1984">>,
+                            <<"opts">> => #{ http_client => httpc }
+                        }
+                    ],
+                <<"strategy">> => <<"Nearest-Integer">>,
+                <<"choose">> => 22,
+                <<"parallel">> => 4,
+                <<"responses">> => 1,
+                <<"stop-after">> => true,
+                <<"admissible-status">> => 200
+            },
+            % Raw data requests via arweave.net gateway.
+            #{
+                <<"template">> => <<"^/arweave/raw">>,
                 <<"node">> =>
                     #{
                         <<"match">> => <<"^/arweave">>,
@@ -290,8 +469,29 @@ default_message() ->
                         <<"opts">> => #{ http_client => httpc, protocol => http2 }
                     }
             },
+            %% General Arweave requests: race both chain nodes, take
+            %% the first 200.
             #{
-                % Routes for raw data requests to use a remote gateway.
+                <<"template">> => <<"^/arweave">>,
+                <<"nodes">> =>
+                    [
+                        #{
+                            <<"match">> => <<"^/arweave">>,
+                            <<"with">> => <<"http://chain-1.arweave.xyz:1984">>,
+                            <<"opts">> => #{ http_client => httpc, protocol => http2 }
+                        },
+                        #{
+                            <<"match">> => <<"^/arweave">>,
+                            <<"with">> => <<"http://chain-2.arweave.xyz:1984">>,
+                            <<"opts">> => #{ http_client => httpc, protocol => http2 }
+                        }
+                    ],
+                <<"parallel">> => true,
+                <<"stop-after">> => 1,
+                <<"admissible-status">> => 200
+            },
+            %% Raw data requests via arweave.net gateway. TODO: Update later.
+            #{
                 <<"template">> => <<"/raw">>,
                 <<"node">> =>
                     #{
@@ -322,6 +522,7 @@ default_message() ->
                     <<"local-store">> => [?DEFAULT_PRIMARY_STORE]
                 }
             ],
+        match_index => [?DEFAULT_PRIMARY_STORE],
         priv_store =>
             [
                 #{
@@ -350,19 +551,28 @@ default_message() ->
             routes => []
         },
         on => #{
-            <<"request">> => #{
-                <<"device">> => <<"auth-hook@1.0">>,
-                <<"path">> => <<"request">>,
-                <<"when">> => #{
-                    <<"keys">> => [<<"authorization">>, <<"!">>]
-                },
-                <<"secret-provider">> =>
+            <<"request">> =>
+                [
                     #{
-                        <<"device">> => <<"http-auth@1.0">>,
-                        <<"access-control">> =>
-                            #{ <<"device">> => <<"http-auth@1.0">> }
+                        <<"device">> => <<"rate-limit@1.0">>
+                    },
+                    #{
+                        <<"device">> => <<"auth-hook@1.0">>,
+                        <<"path">> => <<"request">>,
+                        <<"when">> => #{
+                            <<"keys">> => [<<"authorization">>, <<"!">>]
+                        },
+                        <<"secret-provider">> =>
+                            #{
+                                <<"device">> => <<"http-auth@1.0">>,
+                                <<"access-control">> =>
+                                    #{ <<"device">> => <<"http-auth@1.0">> }
+                            }
+                    },
+                    #{
+                        <<"device">> => <<"name@1.0">>
                     }
-            }
+                ]
         },
         scheduler_default_commitment_spec => <<"httpsig@1.0">>,
         genesis_wasm_import_authorities =>

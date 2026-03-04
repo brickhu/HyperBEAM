@@ -91,7 +91,13 @@ test_suite() ->
         {list_transform, "list transform",
             fun list_transform_test/1},
         {step_hook, "step hook",
-            fun step_hook_test/1}
+            fun step_hook_test/1},
+        {paranoid_message_verification, "paranoid message verification",
+            fun paranoid_message_verification_test/1},
+        {paranoid_input_verification, "paranoid input verification",
+            fun paranoid_input_verification_test/1},
+        {paranoid_result_verification, "paranoid result verification",
+            fun paranoid_result_verification_test/1}
     ].
 
 benchmark_suite() ->
@@ -111,18 +117,20 @@ benchmark_suite() ->
     ].
 
 test_opts() ->
+    CachedExecStore = hb_test_utils:test_store(),
     [
         #{
             name => normal,
             desc => "Default opts",
-            opts => #{},
+            opts => #{ store => hb_test_utils:test_store() },
             skip => []
         },
         #{
             name => without_hashpath,
             desc => "Default without hashpath",
             opts => #{
-                hashpath => ignore
+                hashpath => ignore,
+                store => hb_test_utils:test_store()
             },
             skip => []
         },
@@ -133,10 +141,7 @@ test_opts() ->
                 hashpath => ignore,
                 cache_control => [<<"no-cache">>, <<"no-store">>],
                 spawn_worker => false,
-                store => #{
-                    <<"store-module">> => hb_store_fs,
-                    <<"name">> => <<"cache-TEST/fs">>
-                }
+                store => hb_test_utils:test_store()
             },
             skip => [load_as]
         },
@@ -147,10 +152,7 @@ test_opts() ->
                 hashpath => update,
                 cache_control => [<<"no-cache">>],
                 spawn_worker => false,
-                store => #{
-                    <<"store-module">> => hb_store_fs,
-                    <<"name">> => <<"cache-TEST/fs">>
-                }
+                store => CachedExecStore
             },
             skip => [
                 denormalized_device_name,
@@ -166,10 +168,7 @@ test_opts() ->
                 hashpath => ignore,
                 cache_control => [<<"only-if-cached">>],
                 spawn_worker => false,
-                store => #{
-                    <<"store-module">> => hb_store_fs,
-                    <<"name">> => <<"cache-TEST/fs">>
-                }
+                store => CachedExecStore
             },
             skip => [
                 % Skip test with locally defined device, amongst others.
@@ -195,7 +194,10 @@ test_opts() ->
                 deep_set_with_device,
                 as,
                 as_commitments,
-                step_hook
+                step_hook,
+                paranoid_message_verification,
+                paranoid_input_verification,
+                paranoid_result_verification
             ]
         }
     ].
@@ -840,6 +842,8 @@ load_as_test(Opts) ->
         <<"test_func">> => #{ <<"test_key">> => <<"MESSAGE">> }
     },
     {ok, ID} = hb_cache:write(Msg, Opts),
+    {ok, ReadMsg} = hb_cache:read(ID, Opts),
+    ?assert(hb_message:match(Msg, ReadMsg, primary, Opts)),
     ?assertEqual(
         {ok, <<"MESSAGE">>},
         hb_ao:resolve_many(
@@ -993,6 +997,51 @@ step_hook_test(InitOpts) ->
     ),
     % Test that the step hook was called.
     ?assert(receive {step, Ref} -> true after 100 -> false end).
+
+%% @doc Return the options for paranoid-mode verification tests. Adds the
+%% `paranoid_verify' flag and removes the `error' print option such that the 
+%% error messages are not printed.
+paranoid_opts(RawOpts) ->
+    PrintOpts =
+        case hb_opts:get(debug_print, false, RawOpts) of
+            List when is_list(List) ->
+                List -- [error];
+            Other ->
+                Other
+        end,
+    RawOpts#{
+        paranoid_verify => true,
+        debug_print => PrintOpts
+    }.
+
+paranoid_message_verification_test(RawOpts) ->
+    % Test that the `hb_message:paranoid_verify' infrastructure works correctly.
+    Opts = paranoid_opts(RawOpts),
+    Base = hb_message:normalize_commitments(#{ <<"a">> => 1 }, Opts),
+    ?assert(hb_message:paranoid_verify(Base, Opts)),
+    ?assertThrow(_, hb_message:paranoid_verify(Base#{ <<"a">> => 2 }, Opts)).
+
+paranoid_input_verification_test(RawOpts) ->
+    Opts = paranoid_opts(RawOpts),
+    % Test that the input and base messages are verified prior to execution.
+    Base = hb_message:normalize_commitments(#{ <<"a">> => 1 }, Opts),
+    Request =
+        hb_message:normalize_commitments(
+            #{ <<"path">> => <<"keys">>, <<"a">> => 1 },
+            Opts
+        ),
+    ?assertThrow(_, hb_ao:resolve(Base#{ <<"a">> => 2 }, Request, Opts)),
+    ?assertThrow(_, hb_ao:resolve(Base, Request#{ <<"a">> => 2 }, Opts)).
+
+paranoid_result_verification_test(RawOpts) ->
+    % Test that the result message is verified after execution.
+    Opts = paranoid_opts(RawOpts),
+    Base =
+        hb_message:normalize_commitments(
+            #{ <<"device">> => <<"test-device@1.0">>, <<"a">> => 1 },
+            Opts
+        ),
+    ?assertThrow(_, hb_ao:resolve(Base, <<"mangle">>, Opts)).
 
 %%% Benchmark tests
 benchmark_simple_test(Opts) ->

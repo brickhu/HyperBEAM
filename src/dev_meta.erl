@@ -325,6 +325,7 @@ status_code(ok, _NodeMsg) -> 200;
 status_code(error, _NodeMsg) -> 400;
 status_code(created, _NodeMsg) -> 201;
 status_code(not_found, _NodeMsg) -> 404;
+status_code(client_error, _NodeMsg) -> 400;
 status_code(failure, _NodeMsg) -> 500;
 status_code(unavailable, _NodeMsg) -> 503;
 status_code(unauthorized, _NodeMsg) -> 401;
@@ -456,10 +457,7 @@ is(initiator, Request, NodeMsg) ->
 
 %% @doc Test that we can get the node message.
 config_test() ->
-	StoreOpts = #{
-		<<"store-module">> => hb_store_fs,
-		<<"name">> => <<"cache-TEST">>
-	},
+	StoreOpts = hb_test_utils:test_store(),
     Node = hb_http_server:start_node(Opts = #{ test_config_item => <<"test">>, store => StoreOpts }),
     {ok, Res} = hb_http:get(Node, <<"/~meta@1.0/info">>, Opts),
     ?assertEqual(<<"test">>, hb_ao:get(<<"test_config_item">>, Res, Opts)).
@@ -480,10 +478,7 @@ priv_inaccessible_test() ->
 %% @doc Test that we can't set the node message if the request is not signed by
 %% the owner of the node.
 unauthorized_set_node_msg_fails_test() ->
-	StoreOpts = #{
-		<<"store-module">> => hb_store_fs,
-		<<"name">> => <<"cache-TEST">>
-	},
+	StoreOpts = hb_test_utils:test_store(),
     Node = hb_http_server:start_node(Opts = #{ store => StoreOpts, priv_wallet => ar_wallet:new() }),
     {error, _} =
         hb_http:post(
@@ -504,10 +499,7 @@ unauthorized_set_node_msg_fails_test() ->
 %% @doc Test that we can set the node message if the request is signed by the
 %% owner of the node.
 authorized_set_node_msg_succeeds_test() ->
-	StoreOpts = #{
-		<<"store-module">> => hb_store_fs,
-		<<"name">> => <<"cache-TEST">>
-	},
+	StoreOpts = hb_test_utils:test_store(),
     Owner = ar_wallet:new(),
     Node = hb_http_server:start_node(
         Opts = #{
@@ -543,10 +535,7 @@ uninitialized_node_test() ->
 
 %% @doc Test that a permanent node message cannot be changed.
 permanent_node_message_test() ->
-	StoreOpts = #{
-		<<"store-module">> => hb_store_fs,
-		<<"name">> => <<"cache-TEST">>
-	},
+	StoreOpts = hb_test_utils:test_store(),
     Owner = ar_wallet:new(),
     Node = hb_http_server:start_node(
         Opts =#{
@@ -593,10 +582,7 @@ permanent_node_message_test() ->
 
 %% @doc Test that we can claim the node correctly and set the node message after.
 claim_node_test() ->
-	StoreOpts = #{
-		<<"store-module">> => hb_store_fs,
-		<<"name">> => <<"cache-TEST">>
-	},
+	StoreOpts = hb_test_utils:test_store(),
     Owner = ar_wallet:new(),
     Address = ar_wallet:to_address(Owner),
     Node = hb_http_server:start_node(

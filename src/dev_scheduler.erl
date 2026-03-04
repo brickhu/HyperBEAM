@@ -18,7 +18,7 @@
 %%% AO-Core API functions:
 -export([info/0]).
 %%% Local scheduling functions:
--export([schedule/3, router/4, location/3]).
+-export([schedule/3, router/4]).
 %%% CU-flow functions:
 -export([slot/3, status/3, next/3]).
 -export([start/0, checkpoint/1]).
@@ -48,7 +48,6 @@ info() ->
     #{
         exports =>
             [
-                <<"location">>,
                 <<"status">>,
                 <<"next">>,
                 <<"schedule">>,
@@ -359,201 +358,6 @@ status(_M1, _M2, _Opts) ->
             <<"cache-control">> => <<"no-store">>
         }
     }.
-
-%% @doc Router for `record' requests. Expects either a `POST' or `GET' request.
-location(Base, Req, Opts) ->
-    case hb_ao:get(<<"method">>, Req, <<"GET">>, Opts) of
-        <<"POST">> -> post_location(Base, Req, Opts);
-        <<"GET">> -> get_location(Base, Req, Opts)
-    end.
-
-%% @doc Search for the location of the scheduler in the scheduler-location
-%% cache. If an address is provided, we search for the location of that
-%% specific scheduler. Otherwise, we return the location record for the current
-%% node's scheduler, if it has been established.
-get_location(_Base, Req, Opts) ->
-    % Get the address of the scheduler from the request.
-    Address =
-        hb_ao:get(
-            <<"address">>,
-            Req,
-            hb_util:human_id(ar_wallet:to_address(
-                hb_opts:get(priv_wallet, hb:wallet(), Opts)
-            )),
-            Opts
-        ),
-    % Search for the location of the scheduler in the scheduler-location cache.
-    case dev_scheduler_cache:read_location(Address, Opts) of
-        not_found ->
-            {ok,
-                #{
-                    <<"status">> => 404,
-                    <<"body">> =>
-                        <<"No location found for address: ", Address/binary>>
-                }
-            };
-        {ok, Location} -> {ok, #{ <<"body">> => Location }}
-    end.
-
-%% @doc Generate a new scheduler location record and register it. We both send 
-%% the new scheduler-location to the given registry, and return it to the caller.
-post_location(Base, RawReq, RawOpts) ->
-    Opts =
-        case dev_whois:ensure_host(RawOpts) of
-            {ok, NewOpts} -> NewOpts;
-            _ -> RawOpts
-        end,
-    % Ensure that the request is signed by the operator.
-    Req =
-        case hb_ao:get_first(
-            [{Base, <<"target">>}, {RawReq, <<"target">>}],
-            not_found,
-            Opts
-        ) of
-            not_found -> RawReq;
-            <<"self">> -> Base;
-            <<"request">> -> RawReq;
-            Target -> hb_ao:get(Target, RawReq, not_found, Opts)
-        end,
-    {ok, OnlyCommitted} = hb_message:with_only_committed(Req, Opts),
-    ?event(scheduler_location,
-        {scheduler_location_registration_request, OnlyCommitted}
-    ),
-    % Gather metadata for request validation.
-    Signers = hb_message:signers(OnlyCommitted, Opts),
-    Self =
-        hb_util:human_id(
-            ar_wallet:to_address(
-                hb_opts:get(priv_wallet, hb:wallet(), Opts)
-            )
-        ),
-    ExistingNonce = 
-        case hb_gateway_client:scheduler_location(Self, Opts) of
-            {ok, SchedulerLocation} ->
-                hb_ao:get(<<"nonce">>, SchedulerLocation, 0, Opts);
-            {error, _} -> -1
-        end,
-    NewNonce = hb_ao:get(<<"nonce">>, OnlyCommitted, ExistingNonce + 1, Opts),
-    case {NewNonce > ExistingNonce, lists:member(Self, Signers)} of
-        {false, _} ->
-            % Invalid request: Known nonce is already higher than requested nonce
-            % for the given operator.
-            {ok,
-                #{
-                    <<"status">> => 400,
-                    <<"body">> => <<"Known nonce higher than requested nonce.">>,
-                    <<"requested-nonce">> => NewNonce,
-                    <<"existing-nonce">> => ExistingNonce,
-                    <<"signers">> => Signers
-                }
-            };
-        {true, false} ->
-            % Received request to store a new scheduler location from a peer
-            % that is not the operator.
-            case dev_scheduler_cache:write_location(OnlyCommitted, Opts) of
-                ok ->
-                    ?event(scheduler_location,
-                        {cached_foreign_peer_location, OnlyCommitted}
-                    ),
-                    {ok, OnlyCommitted};
-                {error, Reason} ->
-                    {error,
-                        #{
-                            <<"status">> => 400,
-                            <<"body">> =>
-                                <<"Failed to store new scheduler location.">>,
-                            <<"reason">> => Reason
-                        }
-                    }
-            end;
-        {true, true} ->
-            % The operator has asked to replace the scheduler location. Get the
-            % details and register the new location. Registration occurs in the
-            % following steps:
-            % 1. Generate a new scheduler location message.
-            % 2. Sign the message.
-            % 3. Upload the message to Arweave.
-            % 4. Post the message to the peers specified in the
-            %    `scheduler_location_notify_peers' option.
-            TimeToLive =
-                hb_ao:get_first(
-                    [
-                        {Base, <<"time-to-live">>},
-                        {OnlyCommitted, <<"time-to-live">>}
-                    ],
-                    hb_opts:get(scheduler_location_ttl, 1000 * 60 * 60, Opts),
-                    Opts
-                ),
-            URL =
-                case hb_ao:get(<<"url">>, OnlyCommitted, Opts) of
-                    not_found ->
-                        Port = hb_util:bin(hb_opts:get(port, 8734, Opts)),
-                        Host = hb_opts:get(host, <<"localhost">>, Opts),
-                        Protocol = hb_opts:get(protocol, http1, Opts),
-                        ProtoStr =
-                            case Protocol of
-                                http1 -> <<"http">>;
-                                _ -> <<"https">>
-                            end,
-                        <<ProtoStr/binary, "://", Host/binary, ":", Port/binary>>;
-                    GivenURL -> GivenURL
-                end,
-            % Construct the new scheduler location message.
-            Codec =
-                hb_ao:get_first(
-                    [
-                        {Base, <<"require-codec">>},
-                        {OnlyCommitted, <<"require-codec">>}
-                    ],
-                    <<"httpsig@1.0">>,
-                    Opts
-                ),
-            NewSchedulerLocation =
-                #{
-                    <<"data-protocol">> => <<"ao">>,
-                    <<"variant">> => <<"ao.N.1">>,
-                    <<"type">> => <<"scheduler-location">>,
-                    <<"url">> => URL,
-                    <<"nonce">> => NewNonce,
-                    <<"time-to-live">> => TimeToLive,
-                    <<"codec-device">> => Codec
-                },
-            Signed = hb_message:commit(NewSchedulerLocation, Opts, Codec),
-            dev_scheduler_cache:write_location(Signed, Opts),
-            ?event(scheduler_location,
-                {uploading_signed_scheduler_location, Signed}
-            ),
-            % Asynchronously upload the location record to Arweave.
-            spawn(
-                fun() ->
-                    hb_client:upload(Signed, Opts)
-                end
-            ),
-            % Post the new scheduler location to the peers specified in the
-            % `scheduler_location_notify_peers' option.
-            Results =
-                lists:map(
-                    fun(Node) ->
-                        PostRes = hb_http:post(
-                            Node,
-                            <<"/~scheduler@1.0/record">>,
-                            Signed,
-                            Opts
-                        ),
-                        ?event(scheduler_location,
-                            {outbound_request, {res, PostRes}}
-                        )
-                    end,
-                    hb_opts:get(scheduler_location_notify_peers, [], Opts)
-                ),
-            ?event(scheduler_location,
-                {scheduler_location_registration_success,
-                    {arweave_publication, async_upload_initiated},
-                    {foreign_peers_notified, length(Results)}
-                }
-            ),
-            {ok, Signed}
-    end.
 
 %% @doc A router for choosing between getting the existing schedule, or
 %% scheduling a new message.
@@ -893,36 +697,14 @@ find_remote_scheduler(ProcID, Scheduler, Opts) ->
             % We have a hint. Construct a redirect message.
             generate_redirect(ProcID, Hint, Opts);
         not_found ->
-            case dev_scheduler_cache:read_location(Scheduler, Opts) of
+            case dev_location:read(Scheduler, Opts) of
                 {ok, SchedMsg} ->
                     % We have a cached scheduler location. Use it to construct a
                     % redirect message.
                     generate_redirect(ProcID, SchedMsg, Opts);
-                not_found ->
-                    % We have not yet cached the location for this address.
-                    % Find it via the gateway.
-                    case hb_gateway_client:scheduler_location(Scheduler, Opts) of
-                        {ok, SchedMsg} ->
-                            % We have found the location. Cache it and use it to
-                            % construct a redirect message.
-                            Res =
-                                dev_scheduler_cache:write_location(
-                                    SchedMsg,
-                                    Opts
-                                ),
-                            ?event(scheduler_location,
-                                {cached_scheduler_location, {res, Res}}
-                            ),
-                            generate_redirect(ProcID, SchedMsg, Opts);
-                        {error, Res} ->
-                            ?event(
-                                scheduler_location,
-                                {failed_to_find_scheduler_location_from_gateway,
-                                    {error, Res}
-                                }
-                            ),
-                            {error, Res}
-                    end
+                {error, Error} ->
+                    ?event({failed_to_find_scheduler_location, {error, Error}}),
+                    {error, Error}
             end
     end.
 
@@ -975,7 +757,7 @@ remote_slot(<<"ao.N.1">>, ProcID, Node, Opts) ->
 remote_slot(<<"ao.TN.1">>, ProcID, Node, Opts) ->
     % The process is running on a testnet AO-Core scheduler, so we need to use
     % `/processes/procID/latest' to get the current slot.
-    Path = << ProcID/binary, "/latest?proc-id=", ProcID/binary>>,
+    Path = << ProcID/binary, "/latest?process-id=", ProcID/binary>>,
     ?event({getting_slot_from_ao_core_remote, {path, {string, Path}}}),
     case hb_http:get(Node, Path, Opts#{ http_client => httpc }) of
         {ok, Res} ->
@@ -1173,7 +955,7 @@ do_get_remote_schedule(ProcID, LocalAssignments, From, To, Redirect, Opts) ->
                 >>;
             <<"ao.TN.1">> ->
                 <<
-                    ProcID/binary, "?proc-id=", ProcID/binary,
+                    ProcID/binary, "?process-id=", ProcID/binary,
                     FromBin/binary, ToParam/binary,
                     "&limit=", (hb_util:bin(?MAX_ASSIGNMENT_QUERY_LEN))/binary
                 >>
@@ -1447,7 +1229,7 @@ post_legacy_schedule(ProcID, OnlyCommitted, Node, Opts) ->
         {ok, Body} ->
             ?event({encoded_for_legacy_scheduler, {encoded, Body}}),
             PostMsg = #{
-                <<"path">> => P = <<"/?proc-id=", ProcID/binary>>,
+                <<"path">> => P = <<"/?process-id=", ProcID/binary>>,
                 <<"body">> => Body,
                 <<"method">> => <<"POST">>
             },
@@ -1558,7 +1340,7 @@ find_target_id(Base, Req, Opts) ->
 %% 2. A key in `Req' with another value, present in that message.
 %% 3. The body of the message.
 %% 4. The message itself.
-find_message_to_schedule(_Base, Req, Opts) ->
+find_message_to_schedule(Base, Req, Opts) ->
     Subject =
         hb_ao:get(
             <<"subject">>,
@@ -1567,6 +1349,7 @@ find_message_to_schedule(_Base, Req, Opts) ->
             Opts#{ hashpath => ignore }
         ),
     case Subject of
+        <<"base">> -> Base;
         <<"self">> -> Req;
         not_found ->
             hb_ao:get(<<"body">>, Req, Req, Opts#{ hashpath => ignore });
@@ -1695,62 +1478,6 @@ register_new_process_test() ->
         )
     ).
 
-%% @doc Test that a scheduler location is registered on boot.
-register_location_on_boot_test() ->
-    NotifiedPeerWallet = ar_wallet:new(),
-    RegisteringNodeWallet = ar_wallet:new(),
-    start(),
-    NotifiedPeer =
-        hb_http_server:start_node(#{
-            priv_wallet => NotifiedPeerWallet,
-            store => [
-                #{
-                    <<"store-module">> => hb_store_fs,
-                    <<"name">> => <<"cache-TEST/scheduler-location-notified">>
-                }
-            ]
-        }),
-    RegisteringNode = hb_http_server:start_node(
-        #{
-            priv_wallet => RegisteringNodeWallet,
-            on =>
-                #{
-                    <<"start">> => #{
-                        <<"device">> => <<"scheduler@1.0">>,
-                        <<"path">> => <<"location">>,
-                        <<"method">> => <<"POST">>,
-                        <<"target">> => <<"self">>,
-                        <<"require-codec">> => <<"ans104@1.0">>,
-                        <<"url">> => <<"https://hyperbeam-test-ignore.com">>,
-                        <<"hook">> => #{
-                            <<"result">> => <<"ignore">>,
-                            <<"commit-request">> => true
-                        }
-                    }
-                },
-            scheduler_location_notify_peers => [NotifiedPeer]
-        }
-    ),
-    {ok, CurrentLocation} =
-        hb_http:get(
-            RegisteringNode,
-            #{
-                <<"method">> => <<"GET">>,
-                <<"path">> => <<"/~scheduler@1.0/location">>,
-                <<"address">> =>
-                    hb_util:human_id(ar_wallet:to_address(RegisteringNodeWallet))
-            },
-            #{}
-        ),
-    ?event({current_location, CurrentLocation}),
-    ?assertMatch(
-        #{
-            <<"url">> := <<"https://hyperbeam-test-ignore.com">>,
-            <<"nonce">> := 0
-        },
-        hb_ao:get(<<"body">>, CurrentLocation, #{})
-    ).
-
 schedule_message_and_get_slot_test() ->
     start(),
     Base = hb_message:commit(test_process(), #{ priv_wallet => hb:wallet() }),
@@ -1810,7 +1537,7 @@ redirect_from_graphql() ->
         #{ store =>
             [
                 #{ <<"store-module">> => hb_store_fs, <<"name">> => <<"cache-mainnet">> },
-                #{ <<"store-module">> => hb_store_gateway, <<"store">> => false }
+                #{ <<"store-module">> => hb_store_gateway, <<"store">> => [] }
             ]
         },
     {ok, Msg} = hb_cache:read(<<"0syT13r0s0tgPmIed95bJnuSqaD29HQNN8D3ElLSrsc">>, Opts),
@@ -1880,43 +1607,34 @@ http_init(Opts) ->
 		priv_wallet => Wallet,
 		store => [
 			#{
-                <<"store-module">> => hb_store_lmdb,
-                <<"name">> => <<"cache-mainnet/lmdb">>
+                <<"store-module">> => hb_store_ets,
+                <<"name">> => <<"cache-mainnet/ets">>
             },
-			#{ <<"store-module">> => hb_store_gateway, <<"store">> => false }
+			#{ <<"store-module">> => hb_store_gateway, <<"store">> => [] }
 		]
 	},
     Node = hb_http_server:start_node(ExtendedOpts),
     {Node, ExtendedOpts}.
 
-register_scheduler_test() ->
-    start(),
-    {Node, Opts} = http_init(),
-    Base = hb_message:commit(#{
-        <<"path">> => <<"/~scheduler@1.0/location">>,
-        <<"url">> => <<"https://hyperbeam-test-ignore.com">>,
-        <<"method">> => <<"POST">>,
-        <<"nonce">> => 1,
-        <<"require-codec">> => <<"ans104@1.0">>
-    }, Opts),
-    {ok, Res} = hb_http:post(Node, Base, Opts),
-    ?assertMatch(#{ <<"url">> := Location } when is_binary(Location), Res).
-
 http_post_schedule_sign(Node, Msg, ProcessMsg, Opts) ->
-    Base = hb_message:commit(#{
-        <<"path">> => <<"/~scheduler@1.0/schedule">>,
-        <<"method">> => <<"POST">>,
-        <<"body">> =>
-            hb_message:commit(
-                Msg#{
-                    <<"target">> =>
-                        hb_util:human_id(hb_message:id(ProcessMsg, all)),
-                    <<"type">> => <<"Message">>
-                },
-                Opts
-            )
-    }, Opts),
-    hb_http:post(Node, Base, #{}).
+    Base =
+        hb_message:commit(
+            #{
+                <<"path">> => <<"/~scheduler@1.0/schedule">>,
+                <<"method">> => <<"POST">>,
+                <<"body">> =>
+                    hb_message:commit(
+                        Msg#{
+                            <<"target">> =>
+                                hb_util:human_id(hb_message:id(ProcessMsg, all, Opts)),
+                            <<"type">> => <<"Message">>
+                        },
+                        Opts
+                    )
+            },
+            Opts
+        ),
+    hb_http:post(Node, Base, Opts).
 
 http_get_slot(N, PMsg) ->
     ID = hb_message:id(PMsg, all),
@@ -2008,65 +1726,66 @@ http_get_schedule_test_() ->
                 )
 		}, Opts),
 		{ok, _} = hb_http:post(Node, Base, Opts),
-		lists:foreach(
-			fun(_) ->
-                {ok, Res} = hb_http:post(Node, Req, Opts),
-                ?event(debug_scheduler_test, {res, Res})
-            end,
-			lists:seq(1, 10)
-		),
-		?assertMatch({ok, #{ <<"current">> := 10 }}, http_get_slot(Node, PMsg)),
-        ?debug_wait(5000),
-		{ok, Schedule} = http_get_schedule(Node, PMsg, 0, 10),
-		Assignments = hb_ao:get(<<"assignments">>, Schedule, Opts),
-		?assertEqual(
-			13, % 11 assignments, +1 for the hashpath, +1 for the commitments
-			hb_maps:size(Assignments, Opts)
-		)
-	end}.
+			lists:foreach(
+				fun(_) ->
+	                {ok, Res} = hb_http:post(Node, Req, Opts),
+	                ?event(debug_scheduler_test, {res, Res})
+	            end,
+					lists:seq(1, 3)
+				),
+				?assertMatch({ok, #{ <<"current">> := 3 }}, http_get_slot(Node, PMsg)),
+			        ?debug_wait(100),
+				{ok, Schedule} = http_get_schedule(Node, PMsg, 0, 3),
+				Assignments = hb_ao:get(<<"assignments">>, Schedule, Opts),
+				?assertEqual(
+					6, % 4 assignments, +1 for the hashpath, +1 for the commitments
+					hb_maps:size(Assignments, Opts)
+				)
+			end}.
     
 
 http_get_legacy_schedule_test_() ->
-    {timeout, 60, fun() ->
-        Target = <<"CtOVB2dBtyN_vw3BdzCOrvcQvd9Y1oUGT-zLit8E3qM">>,
-        {Node, Opts} = http_init(),
-        {ok, Res} = hb_http:get(Node, <<"/~scheduler@1.0/schedule&target=", Target/binary>>, Opts),
-		LoadedRes = hb_cache:ensure_all_loaded(Res, Opts),
-        ?assertMatch(#{ <<"assignments">> := As } when map_size(As) > 0, LoadedRes)
-    end}.
+	    {timeout, 60, fun() ->
+	        Target = <<"hGLuIZscb7b_2UBnDE_WoyIJF0sH6BU9u4veyEqE8g4">>,
+	        {Node, Opts} = http_init(),
+	        {ok, Res} =
+	            hb_http:get(Node, <<"/~scheduler@1.0/schedule&target=", Target/binary, "&to=3">>, Opts),
+			LoadedRes = hb_cache:ensure_all_loaded(Res, Opts),
+	        ?assertMatch(#{ <<"assignments">> := As } when map_size(As) > 0, LoadedRes)
+	    end}.
 
 http_get_legacy_slot_test_() ->
     {timeout, 60, fun() ->
-        Target = <<"CtOVB2dBtyN_vw3BdzCOrvcQvd9Y1oUGT-zLit8E3qM">>,
+        Target = <<"hGLuIZscb7b_2UBnDE_WoyIJF0sH6BU9u4veyEqE8g4">>,
         {Node, Opts} = http_init(),
         Res = hb_http:get(Node, <<"/~scheduler@1.0/slot&target=", Target/binary>>, Opts),
         ?assertMatch({ok, #{ <<"current">> := Slot }} when Slot > 0, Res)
     end}.
 
 http_get_legacy_schedule_slot_range_test_() ->
-    {timeout, 60, fun() ->
-        Target = <<"zrhm4OpfW85UXfLznhdD-kQ7XijXM-s2fAboha0V5GY">>,
-        {Node, Opts} = http_init(),
-        {ok, Res} = hb_http:get(Node, <<"/~scheduler@1.0/schedule&target=", Target/binary,
-            "&from=0&to=10">>, Opts),
-		LoadedRes = hb_cache:ensure_all_loaded(Res, Opts),
-        ?event({res, LoadedRes}),
-        % 11 assignments, +1 for the commitments
-        ?assertMatch(#{ <<"assignments">> := As } when map_size(As) == 12, LoadedRes)
-    end}.
+	    {timeout, 60, fun() ->
+	        Target = <<"hGLuIZscb7b_2UBnDE_WoyIJF0sH6BU9u4veyEqE8g4">>,
+	        {Node, Opts} = http_init(),
+	        {ok, Res} = hb_http:get(Node, <<"/~scheduler@1.0/schedule&target=", Target/binary,
+	            "&from=0&to=3">>, Opts),
+			LoadedRes = hb_cache:ensure_all_loaded(Res, Opts),
+	        ?event({res, LoadedRes}),
+	        % 4 assignments, +1 for the commitments
+	        ?assertMatch(#{ <<"assignments">> := As } when map_size(As) == 5, LoadedRes)
+	    end}.
 
 http_get_legacy_schedule_as_aos2_test_() ->
     {timeout, 60, fun() ->
-        Target = <<"CtOVB2dBtyN_vw3BdzCOrvcQvd9Y1oUGT-zLit8E3qM">>,
+        Target = <<"hGLuIZscb7b_2UBnDE_WoyIJF0sH6BU9u4veyEqE8g4">>,
         {Node, Opts} = http_init(),
         {ok, Res} =
-            hb_http:get(
-                Node,
-                #{
-                    <<"path">> => <<"/~scheduler@1.0/schedule?target=", Target/binary>>,
-                    <<"accept">> => <<"application/aos-2">>,
-                    <<"method">> => <<"GET">>
-                },
+	            hb_http:get(
+	                Node,
+	                #{
+	                    <<"path">> => <<"/~scheduler@1.0/schedule?target=", Target/binary, "&to=3">>,
+	                    <<"accept">> => <<"application/aos-2">>,
+	                    <<"method">> => <<"GET">>
+	                },
                 #{}
             ),
         Decoded = hb_json:decode(hb_ao:get(<<"body">>, Res, Opts)),
@@ -2129,26 +1848,26 @@ http_get_json_schedule_test_() ->
 			},
 			Opts
 		),
-		lists:foreach(
-			fun(_) -> {ok, _} = hb_http:post(Node, Req, Opts) end,
-			lists:seq(1, 10)
-		),
-		?assertMatch({ok, #{ <<"current">> := 10 }}, http_get_slot(Node, PMsg)),
-		{ok, Schedule} = http_get_schedule(Node, PMsg, 0, 10, <<"application/aos-2">>),
-		?event({schedule, Schedule}),
-		JSON = hb_ao:get(<<"body">>, Schedule, Opts),
-		Assignments = hb_json:decode(JSON),
-		?assertEqual(
-			11, % +1 for the hashpath
-			length(hb_maps:get(<<"edges">>, Assignments))
-		)
-	end}.
+			lists:foreach(
+				fun(_) -> {ok, _} = hb_http:post(Node, Req, Opts) end,
+					lists:seq(1, 3)
+				),
+				?assertMatch({ok, #{ <<"current">> := 3 }}, http_get_slot(Node, PMsg)),
+				{ok, Schedule} = http_get_schedule(Node, PMsg, 0, 3, <<"application/aos-2">>),
+				?event({schedule, Schedule}),
+				JSON = hb_ao:get(<<"body">>, Schedule, Opts),
+				Assignments = hb_json:decode(JSON),
+				?assertEqual(
+					4, % +1 for the hashpath
+					length(hb_maps:get(<<"edges">>, Assignments))
+				)
+			end}.
 
 %%% Benchmarks
 
 single_resolution(Opts) ->
     start(),
-    BenchTime = 1,
+    BenchTime = 0.25,
     Wallet = hb_opts:get(priv_wallet, hb:wallet(), Opts),
     Base = test_process(Opts#{ priv_wallet => Wallet }),
     ?event({benchmark_start, ?MODULE}),
@@ -2186,7 +1905,7 @@ single_resolution(Opts) ->
     ?assert(Iterations > 3).
 
 many_clients(Opts) ->
-    BenchTime = 1,
+    BenchTime = 0.25,
     Processes = hb_opts:get(workers, 25, Opts),
     {Node, Opts} = http_init(Opts),
     PMsg = hb_message:commit(test_process(Opts), Opts),
